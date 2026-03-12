@@ -25,6 +25,28 @@ type MQTT struct {
 	eventHandler   EventHandlerFunc
 }
 
+// newLastWillPayload returns the JSON payload for the MQTT LastWill message
+// (connection status offline). A fresh payload is built each time so
+// message-id and timestamp are distinct per connection.
+func newLastWillPayload() ([]byte, error) {
+	return json.Marshal(&yggdrasil.ConnectionStatus{
+		Type:      yggdrasil.MessageTypeConnectionStatus,
+		MessageID: uuid.New().String(),
+		Version:   1,
+		Sent:      time.Now(),
+		Content: struct {
+			CanonicalFacts map[string]interface{}       "json:\"canonical_facts\""
+			Dispatchers    map[string]map[string]string "json:\"dispatchers\""
+			State          yggdrasil.ConnectionState    "json:\"state\""
+			Tags           map[string]string            "json:\"tags,omitempty\""
+			ClientVersion  string                       "json:\"client_version,omitempty\""
+		}{
+			State:         yggdrasil.ConnectionStateOffline,
+			ClientVersion: constants.Version,
+		},
+	})
+}
+
 // NewMQTTTransport creates a transport suitable for transmitting data over a
 // set of MQTT topics.
 func NewMQTTTransport(clientID string, brokers []string, tlsConfig *tls.Config) (*MQTT, error) {
@@ -49,20 +71,44 @@ func NewMQTTTransport(clientID string, brokers []string, tlsConfig *tls.Config) 
 	opts.SetOnConnectHandler(func(c mqtt.Client) {
 		t.events <- TransporterEventConnected
 
-		opts := c.OptionsReader()
-		for _, url := range opts.Servers() {
+		reader := c.OptionsReader()
+
+		// Set a fresh LastWill for the next time we connect, so each
+		// disconnect delivers a distinct message (message-id, timestamp)
+		// to the broker instead of reusing the initial will.
+		data, err := newLastWillPayload()
+		if err != nil {
+			log.Errorf("cannot marshal LastWill message to JSON: %v", err)
+		} else {
+			t.opts.SetBinaryWill(
+				fmt.Sprintf(
+					"%v/%v/control/out",
+					config.DefaultConfig.PathPrefix,
+					reader.ClientID(),
+				),
+				data,
+				1,
+				false,
+			)
+		}
+
+		for _, url := range reader.Servers() {
 			log.Tracef("connected to broker: %v", url)
 		}
 
 		// Publish a throwaway message in case the topic does not exist;
 		// this is a workaround for the Akamai MQTT broker implementation.
 		go func() {
-			topic := fmt.Sprintf("%v/%v/data/out", config.DefaultConfig.PathPrefix, opts.ClientID())
+			topic := fmt.Sprintf(
+				"%v/%v/data/out",
+				config.DefaultConfig.PathPrefix,
+				reader.ClientID(),
+			)
 			c.Publish(topic, 0, false, []byte{})
 		}()
 
 		var topic string
-		topic = fmt.Sprintf("%v/%v/data/in", config.DefaultConfig.PathPrefix, opts.ClientID())
+		topic = fmt.Sprintf("%v/%v/data/in", config.DefaultConfig.PathPrefix, reader.ClientID())
 		c.Subscribe(topic, 1, func(c mqtt.Client, m mqtt.Message) {
 			go func() {
 				if t.receiveHandler == nil {
@@ -75,7 +121,7 @@ func NewMQTTTransport(clientID string, brokers []string, tlsConfig *tls.Config) 
 		})
 		log.Tracef("subscribed to topic: %v", topic)
 
-		topic = fmt.Sprintf("%v/%v/control/in", config.DefaultConfig.PathPrefix, opts.ClientID())
+		topic = fmt.Sprintf("%v/%v/control/in", config.DefaultConfig.PathPrefix, reader.ClientID())
 		c.Subscribe(topic, 1, func(c mqtt.Client, m mqtt.Message) {
 			go func() {
 				if t.receiveHandler == nil {
@@ -110,28 +156,13 @@ func NewMQTTTransport(clientID string, brokers []string, tlsConfig *tls.Config) 
 		log.Debugf("reconnecting to broker: %v", co.Servers)
 	})
 
-	data, err := json.Marshal(&yggdrasil.ConnectionStatus{
-		Type:      yggdrasil.MessageTypeConnectionStatus,
-		MessageID: uuid.New().String(),
-		Version:   1,
-		Sent:      time.Now(),
-		Content: struct {
-			CanonicalFacts map[string]interface{}       "json:\"canonical_facts\""
-			Dispatchers    map[string]map[string]string "json:\"dispatchers\""
-			State          yggdrasil.ConnectionState    "json:\"state\""
-			Tags           map[string]string            "json:\"tags,omitempty\""
-			ClientVersion  string                       "json:\"client_version,omitempty\""
-		}{
-			State:         yggdrasil.ConnectionStateOffline,
-			ClientVersion: constants.Version,
-		},
-	})
+	data, err := newLastWillPayload()
 	if err != nil {
-		return nil, fmt.Errorf("cannot marshal message to JSON: %w", err)
+		return nil, fmt.Errorf("cannot marshal LastWill message to JSON: %w", err)
 	}
 
 	opts.SetBinaryWill(
-		fmt.Sprintf("%v/%v/control/out", config.DefaultConfig.PathPrefix, opts.ClientID),
+		fmt.Sprintf("%v/%v/control/out", config.DefaultConfig.PathPrefix, clientID),
 		data,
 		1,
 		false,
